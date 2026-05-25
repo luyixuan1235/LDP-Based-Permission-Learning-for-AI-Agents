@@ -357,7 +357,7 @@ ai-agent-permissions\results\rq1_coverage_vs_threshold.png
 
 ---
 
-8. 如果只想看最终数值
+## 8. 如果只想看最终数值
 
 直接打开：
 
@@ -387,9 +387,9 @@ MoE 不需要 LLM API，也不需要上传完整用户历史，是后续 Federat
 
 ---
 
-9. 常见问题
+## 9. 常见问题
 
-Q1: 报错找不到 `../data/processed_dataset.json`
+### Q1: 报错找不到 `../data/processed_dataset.json`
 
 说明运行目录错了。
 
@@ -401,7 +401,7 @@ ai-agent-permissions\src
 
 再运行脚本。
 
-Q2: `torch` 找不到
+### Q2: `torch` 找不到
 
 安装：
 
