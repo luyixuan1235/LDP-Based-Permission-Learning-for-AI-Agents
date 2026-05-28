@@ -1,450 +1,186 @@
-# REAL README: RQ1 MoE 实验运行指南
+你这个项目的**正确实验逻辑顺序**，可以整理成一条很清晰的“问题驱动链条”：
 
-这个文件记录当前仓库里新增的 RQ1 实验怎么跑、结果放在哪里、图怎么生成。
+## 0) 先立论文主问题（你图里的 Problem + Gap）
+先明确三件事：
 
-当前 RQ1 目标是验证：
+- 需要个性化（用户异质性真实存在）
+- MoE 能提升个性化，但会引入 routing 泄露面
+- 只追准确率不够，必须做 utility–privacy tradeoff
 
-> MoE-only 是否能提升 AI agent 权限预测的准确率和高置信覆盖率。
-
-本阶段暂时不引入 LDP / 联邦学习，只比较四个方法：
-
-1. `AgentPerms (IC+CF)`：原始论文方法，LLM + collaborative filtering。
-2. `No Personalization`：单模型，所有用户共享一个模型。
-3. `Clustering`：先按用户历史偏好聚类，每个 cluster 训练一个模型。
-4. `MoE-only`：多个 experts + gate，根据用户画像和当前权限请求动态路由。
+这一步是全文叙事锚点：**“提升个性化 → 引入新攻击面 → 设计防御 → 看效用-隐私折中”**。
 
 ---
 
-## 1. 目录位置
+## 1) RQ1 先做“性能基线建立”（你已经在做）
+### 目的
+验证 MoE/FedMoE 在准确率、高置信覆盖上的价值，证明“值得做个性化”。
 
-所有命令建议在：
+### 实验顺序
+1. 跑 baselines：`AgentPerms(IC+CF)`、`No personalization`、`Clustering`
+2. 跑 `MoE-only (centralized)`
+3. 跑 `Federated MoE`（无LDP）
+4. 统一画两张曲线（accuracy vs threshold, coverage vs threshold），并且同图比较 5 条线
 
-```powershell
-ai-agent-permissions\src
-```
+### 你要回答的问题
+- MoE-only 是否明显提升了个性化性能？
+- FedMoE 与 MoE-only 的性能 gap 多大？
+- FedMoE 是否至少在高置信覆盖上有优势？
 
-下运行。
-
-也就是：
-
-```powershell
-cd "C:\Users\luyixuan\Desktop\大三下\计算机网络安全\Privacy of ai-agent-permission\ai-agent-permissions\src"
-```
-
-不要在 `ai-agent-permissions` 根目录直接运行这些脚本，因为脚本里使用了相对路径：
-
-```text
-../data
-../queries.json
-../results
-```
+> 这一步输出的是“性能收益与差距”，不是隐私结论。
 
 ---
 
-## 2. 安装依赖
+## 2) 从 RQ1 结果“提出新问题”（过渡到安全）
+当你证明 MoE 个性化有效后，顺势提出：
 
-如果还没安装依赖，先回到 `ai-agent-permissions` 目录：
+- gating 是否泄露 expert 偏好？
+- membership/preference inference 是否更容易？
 
-```powershell
-cd ..
-pip install -r requirements.txt
-```
-
-新增 RQ1 实验需要：
-
-```text
-torch
-matplotlib
-scikit-learn
-numpy
-pandas
-```
-
-如果 `torch` 安装失败，可以单独安装 CPU 版本：
-
-```powershell
-pip install torch
-```
-
-然后再回到 `src`：
-
-```powershell
-cd src
-```
+这正是你图里的创新点：**MoE 提升性能，但带来新泄露面**。
 
 ---
 
-## 3. 输入数据
+## 3) RQ3 攻击实验（先不加防御）
+### 目的
+量化“新攻击面到底多严重”。
 
-新实验主要读取这些文件：
+### 按图中顺序做
+1. **Membership inference**（shadow + confidence attack）
+2. **Gating leakage attack（新）**（crafted queries 推断 expert，再推偏好）
+3. **Prompt injection 鲁棒性**（成功率）
 
-```text
-data\processed_dataset.json
-data\data_types.csv
-queries.json
-```
-
-其中：
-
-- `processed_dataset.json`：181 个过滤后的用户，包含每个用户的 `training` / `testing` 权限决策。
-- `data_types.csv`：raw data type 到 generic data type 的映射。
-- `queries.json`：65 个 AI agent 任务场景，包含 domain、tool、data type 等信息。
-
-实验只使用二分类标签：
-
-```text
-Yes, always share -> 1
-No, never share   -> 0
-```
-
-其他 ask-first 类型标签会被过滤。
+### 输出
+隐私指标曲线/表格：
+- attack AUC / inference accuracy / leakage proxy
 
 ---
 
-## 4. 运行顺序
+## 4) 引入防御机制（方法主体）
+按你图里的方法组合做：
 
-### Step 1: 单模型 No Personalization
+- entropy regularization
+- stochastic gating
+- expert smoothing
+- selective LDP（只在用户侧信号）
 
-```powershell
-python permission_no_personalization.py
-```
-
-输出：
-
-```text
-results\no_personalization_predictions.json
-results\no_personalization_metrics.json
-```
-
-这个模型不使用用户画像，也不使用用户 ID。它只看当前权限请求：
-
-```text
-query_id + receiver + generic_data_type + domain
-```
-
-作用：作为没有个性化能力的全局 baseline。
+关键原则（你现在也认同）：  
+**不扰动语义主干，只扰动用户统计或 gating auxiliary features。**
 
 ---
 
-### Step 2: 聚类个性化 Clustering
+## 5) RQ2 做 Selective LDP epsilon sweep（utility–privacy tradeoff）
+### 目的
+回答“哪种噪声位置 + 哪个 ε 最优”。
 
-```powershell
-python permission_clustering.py
-```
+### 固定设置
+- ε ∈ {0.5, 1, 2, 4, 8}
+- 噪声位置：`user_stats` vs `gating_input`
 
-输出：
+### 输出图
+- accuracy vs ε
+- coverage vs ε
+- tradeoff score vs ε（要改成隐私正向加分或约束式选择）
 
-```text
-results\clustering_personalization_predictions.json
-results\clustering_personalization_metrics.json
-```
-
-这个模型先根据用户训练历史构造用户画像，然后用 KMeans 聚类：
-
-```text
-默认 cluster 数量 = 4
-```
-
-每个 cluster 单独训练一个 MLP。
-
-作用：作为粗粒度个性化 baseline。
+### 决策逻辑
+先设 utility 底线（accuracy/coverage 不低于阈值），在可行集合选最小 ε。  
+这比“盲目最大 score”更符合论文叙事。
 
 ---
 
-### Step 3: MoE-only
+## 6) Ablation（支撑你的方法有效性）
+按你图里列的 ablation 顺序：
 
-```powershell
-python permission_moe.py
-```
+- 无LDP
+- 无MoE
+- experts 数量 4/8/16
+- gating noise vs 无噪
+- 本地 gate vs 全局 gate
 
-输出：
-
-```text
-results\moe_rq1_predictions.json
-results\moe_rq1_metrics.json
-```
-
-MoE 架构：
-
-```text
-ContextEncoder(query_id, receiver, generic_data_type, domain)
-        -> context vector z
-
-concat(z, user_profile)
-        -> gate network
-        -> expert weights
-
-experts(z)
-        -> expert predictions
-
-weighted sum
-        -> final p_allow
-```
-
-默认配置：
-
-```text
-n_experts = 4
-top_k = 2
-epochs = 60
-load_balance_coef = 0.01
-```
-
-作用：验证 MoE 是否比单模型和聚类个性化更有效。
+目标是回答：每个设计到底贡献了什么。
 
 ---
 
-### Step 4: 生成两张 RQ1 折线图
-
-```powershell
-python rq1_visualization.py
-```
-
-它会读取：
-
-```text
-results\ic_cf_predictions.json
-results\no_personalization_predictions.json
-results\clustering_personalization_predictions.json
-results\moe_rq1_predictions.json
-```
-
-然后输出：
-
-```text
-results\rq1_threshold_curves.json
-results\rq1_accuracy_vs_threshold.png
-results\rq1_coverage_vs_threshold.png
-```
-
-两张图分别是：
-
-```text
-Accuracy vs. confidence threshold τ
-Coverage vs. confidence threshold τ
-```
+## 7) RQ4 用户/系统维度（可选加强）
+你图里有 Trust score、Perceived control、Latency、通信开销、模型大小。  
+即使先做轻量版，也能让论文从“纯ML”升级为“AI-agent systems + security”完整故事。
 
 ---
 
-## 5. 四个方法的结果来源
-
-| 方法 | 是否需要新跑 | 预测文件 |
-|---|---|---|
-| AgentPerms (IC+CF) | 不一定，默认复用旧结果 | `results\ic_cf_predictions.json` |
-| No Personalization | 需要跑 | `results\no_personalization_predictions.json` |
-| Clustering | 需要跑 | `results\clustering_personalization_predictions.json` |
-| MoE-only | 需要跑 | `results\moe_rq1_predictions.json` |
-
-注意：
-
-当前 `AgentPerms (IC+CF)` 的旧结果可以直接用于画图，但旧代码里可能存在一个问题：
-
-```text
-cf_scores.csv 的 user_id 是整数，
-permission_ic_cf.py 查找的是 P039 这种用户 ID。
-```
-
-因此旧 `IC+CF` 结果可能没有真正注入 CF 推荐。正式写论文前，最好修复这个 ID 映射问题后重跑 IC+CF。
+## 一句话总结你的最终论文主线
+**先用 RQ1 证明个性化收益，再用 RQ3证明 MoE 新泄露面，再用“entropy+stochastic+smoothing+selective LDP”在 RQ2 上给出可复现的 utility–privacy 最优点，最后用 ablation 拆贡献。**
 
 ---
 
-## 6. 指标解释
+如果你要，我下一步可以按这个顺序给你直接写成“实验章节草稿模板”（每节该放哪些图、表、结论句）。
 
-每个模型都会输出：
 
-```text
-accuracy
-precision
-recall
-f1
-fpr
-fnr
-auc
-high_conf_accuracy
-coverage
-```
 
-其中最重要的是：
+你这个问题非常关键，答案先说清楚：
 
-### Accuracy
+**Federated MoE ≠ 自动包含 LDP。**
 
-全体测试样本上的准确率：
+- `Federated MoE` 解决的是**数据不出端**（训练范式）
+- `LDP` 解决的是**数据出端前先扰动**（隐私机制）
+- 两者互补，但不是同一个东西
 
-```text
-预测正确数量 / 测试样本总数
-```
+所以，**Federated_moe 的设计可以承载 LDP**，但需要你显式定义“在哪个信号上、以什么机制、用多少预算 ε 加噪”。
 
-### Confidence
+---
 
-模型对最终预测标签的置信度。
+## 你现在这套能不能算“已融入 LDP”？
 
-对于我们自己的三个神经模型：
+严格说：**是“原型级融入”**，但还不算论文级完整方案。  
+因为当前更多是“加噪开关”，还缺：
 
-```text
-p_allow = 模型认为应该 allow 的概率
-confidence = max(p_allow, 1 - p_allow)
-```
+1. 预算分配（不同信号分 ε）
+2. 一致的隐私会计（composition）
+3. 避免重复扰动（当前 `user_stats` 有二次扰动风险）
+4. 攻击面指标闭环（加噪后要测 leakage 下降）
 
+---
+
+## 可行的正式设计方案（推荐）
+
+### 1) 三通道拆分（最重要）
+把输入分成三类：
+
+- **语义上下文通道**（query/tool/domain/data type）  
+  - 不加 LDP（这是公共任务语义，且是性能主干）
+- **用户统计通道**（历史授权率、偏好 summary）  
+  - 加 LDP（本地扰动后再喂 gate）
+- **gating 辅助通道**（用户侧附加特征）  
+  - 可选加小噪（stochastic gating）
+
+这就是你要的 **Selective LDP**。
+
+### 2) 预算分配（ε_total）
 例如：
+- `ε_total ∈ {0.5,1,2,4,8}`
+- 分配：`ε_stats = 0.7 * ε_total`, `ε_gate = 0.3 * ε_total`
+- 不再对同一信号重复加噪（避免“过噪”）
 
-```text
-p_allow = 0.90 -> 预测 allow，confidence = 0.90
-p_allow = 0.10 -> 预测 deny， confidence = 0.90
-p_allow = 0.55 -> 预测 allow，confidence = 0.55
-```
+### 3) 机制匹配
+- 连续值（allow-rate/profile）：Laplace / Gaussian 本地扰动
+- gate 输入随机化：小尺度噪声 + 熵正则（entropy reg）
+- expert 输出平滑：expert smoothing，降低路由可识别性
 
-### Confidence threshold τ
-
-阈值 `τ` 表示：
-
-```text
-只保留 confidence >= τ 的预测
-```
-
-`τ` 越大，模型越谨慎。
-
-### Coverage / 高置信覆盖率
-
-```text
-coverage(τ) = confidence >= τ 的样本数量 / 全部测试样本数量
-```
-
-它表示在阈值 `τ` 下，模型能自动处理多少比例的权限请求。
-
-随着 `τ` 增大，coverage 应该单调下降或保持不变。
-
-### Accuracy vs. τ
-
-可视化里的 accuracy 不是全体 accuracy，而是：
-
-```text
-在 confidence >= τ 的样本子集上的 accuracy
-```
-
-通常：
-
-```text
-τ 越大 -> accuracy 越高，但 coverage 越低
-```
-
-这体现的是自动化权限决策中的 tradeoff：
-
-```text
-更可靠的自动决策 <-> 更少的自动覆盖范围
-```
+### 4) 联邦训练不变
+仍保持：
+- server 聚合：encoder + experts
+- client 私有：gate
+- 这样既保留个性化，又不上传路由偏好参数
 
 ---
 
-## 7. 推荐完整运行命令
+## 论文里可以怎么表述
 
-在 PowerShell 中：
-
-```powershell
-cd "C:\Users\luyixuan\Desktop\大三下\计算机网络安全\Privacy of ai-agent-permission\ai-agent-permissions\src"
-
-python permission_no_personalization.py
-python permission_clustering.py
-python permission_moe.py
-python rq1_visualization.py
-```
-
-运行结束后看：
-
-```text
-ai-agent-permissions\results\rq1_accuracy_vs_threshold.png
-ai-agent-permissions\results\rq1_coverage_vs_threshold.png
-```
+“我们提出 **Federated MoE + Selective LDP**：  
+LDP 仅作用于用户侧个性化信号（history stats / gating auxiliaries），而不作用于语义上下文主干；从而在降低 membership / preference / gating leakage 风险的同时，尽量保持 utility（accuracy + coverage）。”
 
 ---
 
-## 8. 如果只想看最终数值
-
-直接打开：
-
-```text
-results\no_personalization_metrics.json
-results\clustering_personalization_metrics.json
-results\moe_rq1_metrics.json
-results\ic_cf_metrics.json
-```
-
-重点看：
-
-```text
-accuracy
-high_conf_accuracy
-coverage
-auc
-```
-
-当前 RQ1 论文叙事可以围绕：
-
-```text
-MoE 在较低/中等 confidence threshold 下准确率最高；
-MoE 在较高 threshold 下仍保持较高 coverage；
-MoE 不需要 LLM API，也不需要上传完整用户历史，是后续 Federated + LDP 的基础。
-```
-
----
-
-## 9. 常见问题
-
-### Q1: 报错找不到 `../data/processed_dataset.json`
-
-说明运行目录错了。
-
-请进入：
-
-```powershell
-ai-agent-permissions\src
-```
-
-再运行脚本。
-
-### Q2: `torch` 找不到
-
-安装：
-
-```powershell
-pip install torch
-```
-
-### Q3: 可视化脚本跳过某个 baseline
-
-如果看到：
-
-```text
-[skip] missing: ...
-```
-
-说明对应预测文件还没生成。
-
-先运行对应脚本。
-
-### Q4: 旧结果会不会被覆盖？
-
-会。以下文件会被覆盖：
-
-```text
-results\no_personalization_predictions.json
-results\no_personalization_metrics.json
-results\clustering_personalization_predictions.json
-results\clustering_personalization_metrics.json
-results\moe_rq1_predictions.json
-results\moe_rq1_metrics.json
-results\rq1_threshold_curves.json
-results\rq1_accuracy_vs_threshold.png
-results\rq1_coverage_vs_threshold.png
-```
-
-如果要保留旧结果，先备份：
-
-```powershell
-cd ..\results
-mkdir backup_rq1
-copy no_personalization_* backup_rq1\
-copy clustering_personalization_* backup_rq1\
-copy moe_rq1_* backup_rq1\
-copy rq1_* backup_rq1\
-```
-
+如果你愿意，我下一步可以按这个正式方案把你现有代码收敛成一个“论文版实现”：  
+- 去掉 `user_stats` 二次加噪  
+- 加 `ε` 预算拆分  
+- 输出统一 privacy accounting 字段（每次实验写入 metrics）  
+这样你的 RQ2 和 RQ3 会更有说服力。
