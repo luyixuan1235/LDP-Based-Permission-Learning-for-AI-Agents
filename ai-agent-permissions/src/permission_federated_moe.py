@@ -77,6 +77,7 @@ DROPOUT = env_float("FED_MOE_DROPOUT", 0.2)
 LOAD_BALANCE_COEF = env_float("FED_MOE_LOAD_BALANCE_COEF", 0.01)
 LOCAL_PRIOR_ALPHA = env_float("FED_MOE_LOCAL_PRIOR_ALPHA", 0.1)
 LOCAL_PRIOR_CONF_THRESHOLD = env_float("FED_MOE_LOCAL_PRIOR_CONF_THRESHOLD", 0.6)
+LOCAL_PRIOR_ENABLED = bool(env_int("FED_MOE_LOCAL_PRIOR_ENABLED", 1))
 LDP_MODE = env_str("FED_MOE_LDP_MODE", "none").lower()  # none | user_stats | gating_input
 LDP_EPSILON = env_float("FED_MOE_LDP_EPSILON", 8.0)
 OUTPUT_TAG = env_str("FED_MOE_OUTPUT_TAG", "")
@@ -214,14 +215,145 @@ def combine_predictions(expert_probs, gate_weights):
     return (gate_weights * expert_probs).sum(dim=-1).clamp(1e-6, 1.0 - 1e-6)
 
 
-def apply_user_stats_ldp(user_profiles, epsilon):
-    """Add LDP-style Laplace noise to user profile statistics (range [0, 1])."""
-    epsilon = max(float(epsilon), 1e-6)
-    noisy = np.asarray(user_profiles, dtype=np.float32).copy()
-    scale = 1.0 / epsilon
-    noise = np.random.laplace(loc=0.0, scale=scale, size=noisy.shape).astype(np.float32)
-    noisy = np.clip(noisy + noise, 0.0, 1.0)
-    return noisy
+def binary_rr(bit, epsilon, rng):
+    """Warner's binary randomized response (epsilon-LDP for a single bit)."""
+    p = np.exp(epsilon) / (1.0 + np.exp(epsilon))
+    if rng.random() < p:
+        return int(bit)
+    return 1 - int(bit)
+
+
+def categorical_rr(value, k, epsilon, rng):
+    """Generalized randomized response for k categories (0-indexed)."""
+    p = np.exp(epsilon) / (np.exp(epsilon) + k - 1)
+    if rng.random() < p:
+        return int(value)
+    candidates = [v for v in range(k) if v != int(value)]
+    return candidates[rng.integers(len(candidates))]
+
+
+def calibrate_rr_mean(noisy_mean, epsilon):
+    """Debias the mean of binary-RR-perturbed values."""
+    p = np.exp(epsilon) / (1.0 + np.exp(epsilon))
+    denom = 2.0 * p - 1.0
+    if abs(denom) < 1e-12:
+        return 0.5
+    calibrated = (noisy_mean - (1.0 - p)) / denom
+    return float(np.clip(calibrated, 0.0, 1.0))
+
+
+# (field_name, k_categories, min_value, normalization_divisor)
+_BIO_FIELD_SPEC = [
+    ("ai_familiarity",    5, 1, 5.0),
+    ("ai_frequency",      5, 1, 5.0),
+    ("ai_trust",          5, 1, 5.0),
+    ("privacy_importance", 5, 1, 5.0),
+    ("age",               7, 1, 7.0),
+    ("gender",            4, 0, 3.0),
+    ("education",         6, 1, 6.0),
+]
+
+LDP_EPS_HISTORY_RATIO = env_float("FED_MOE_LDP_EPS_HISTORY_RATIO", 0.8)
+
+
+def build_user_profiles_with_rr_ldp(
+    train_records, bio_features, vocab, epsilon, seed=42,
+):
+    """Build user profiles with Randomized-Response-based LDP.
+
+    Budget split (sequential composition):
+        eps_history = epsilon * ratio     -> binary RR on each permission decision
+        eps_bio     = epsilon * (1-ratio) -> categorical RR on each survey field
+
+    Permission history flow:
+        1. Each binary label (0/1) is perturbed via Warner's RR
+        2. Perturbed labels are aggregated into per-domain and overall allow rates
+        3. Rates are calibrated (debiased) to remove RR bias
+
+    Bio / survey features flow:
+        1. Each ordinal field is perturbed via generalized (k-ary) RR
+        2. Perturbed value is normalized to [0,1] the same way as the original
+    """
+    from rq1_data_utils import UNKNOWN_TOKEN
+
+    rng = np.random.default_rng(seed)
+    eps_history = max(epsilon * LDP_EPS_HISTORY_RATIO, 1e-6)
+    eps_bio = max(epsilon * (1.0 - LDP_EPS_HISTORY_RATIO), 1e-6)
+
+    domain_vocab = vocab["domain"]
+    n_domains = len(domain_vocab)
+
+    user_records = {}
+    for rec in train_records:
+        user_records.setdefault(rec["user_id"], []).append(rec)
+
+    user_ids = sorted(bio_features.keys())
+    profiles = []
+    perturbed_train_records = []
+
+    n_rr_flipped = 0
+    n_rr_total = 0
+
+    for user_id in user_ids:
+        recs = user_records.get(user_id, [])
+
+        # ---- Binary RR on each permission decision ----
+        perturbed_labels = []
+        for r in recs:
+            original = int(r["label"])
+            perturbed = binary_rr(original, eps_history, rng)
+            if perturbed != original:
+                n_rr_flipped += 1
+            n_rr_total += 1
+            perturbed_labels.append(perturbed)
+            private_record = dict(r)
+            private_record["label"] = int(perturbed)
+            perturbed_train_records.append(private_record)
+
+        # Aggregate + calibrate
+        if perturbed_labels:
+            noisy_overall = float(np.mean(perturbed_labels))
+            overall_allow = calibrate_rr_mean(noisy_overall, eps_history)
+        else:
+            overall_allow = 0.5
+
+        domain_allow = np.full(n_domains, overall_allow, dtype=np.float32)
+        for d_name, d_idx in domain_vocab.items():
+            if d_name == UNKNOWN_TOKEN:
+                continue
+            d_perturbed = [
+                perturbed_labels[i]
+                for i, r in enumerate(recs)
+                if r["domain"] == d_name
+            ]
+            if d_perturbed:
+                noisy_d = float(np.mean(d_perturbed))
+                domain_allow[d_idx] = calibrate_rr_mean(noisy_d, eps_history)
+
+        # ---- Categorical RR on bio / survey features ----
+        bio = bio_features[user_id]
+        bio_vec = np.zeros(len(_BIO_FIELD_SPEC), dtype=np.float32)
+        for j, (field, k, min_val, divisor) in enumerate(_BIO_FIELD_SPEC):
+            original_val = int(bio[field])
+            zero_indexed = max(0, min(k - 1, original_val - min_val))
+            perturbed_zi = categorical_rr(zero_indexed, k, eps_bio, rng)
+            bio_vec[j] = float(perturbed_zi + min_val) / divisor
+
+        profile = np.concatenate([
+            domain_allow,
+            bio_vec,
+            np.array([overall_allow], dtype=np.float32),
+        ]).astype(np.float32)
+        profiles.append(profile)
+
+    flip_rate = n_rr_flipped / max(n_rr_total, 1)
+    print(f"  RR binary flip rate : {flip_rate:.3f}  "
+          f"({n_rr_flipped}/{n_rr_total})")
+    print(f"  eps_history={eps_history:.2f}  eps_bio={eps_bio:.2f}")
+
+    profiles_arr = np.stack(profiles, axis=0).astype(np.float32)
+    user_to_idx = {uid: i for i, uid in enumerate(user_ids)}
+    return profiles_arr, user_to_idx, perturbed_train_records
 
 
 def semantic_text_for_record(rec, queries_by_id):
@@ -562,14 +694,6 @@ def apply_local_prior_calibration(probs, test_records, prior_model):
 
     for i, rec in enumerate(test_records):
         prior_p = local_prior_probability(prior_model, rec)
-        if LDP_MODE == "user_stats":
-            prior_p = float(
-                np.clip(
-                    prior_p + np.random.laplace(loc=0.0, scale=1.0 / max(LDP_EPSILON, 1e-6)),
-                    0.0,
-                    1.0,
-                )
-            )
         prior_conf = max(prior_p, 1.0 - prior_p)
         if prior_conf >= LOCAL_PRIOR_CONF_THRESHOLD:
             calibrated[i] = prior_p
@@ -723,12 +847,16 @@ def main():
     print(f"  Test  records : {len(test_records)}")
 
     vocab = build_vocab(train_records)
-    user_profiles, user_to_idx = build_user_profiles(
-        train_records, bio_features, vocab
-    )
     if LDP_MODE == "user_stats":
-        print("Applying LDP noise to user profile statistics...")
-        user_profiles = apply_user_stats_ldp(user_profiles, LDP_EPSILON)
+        print(f"  Building user profiles with RR-based LDP (eps={LDP_EPSILON})...")
+        user_profiles, user_to_idx, private_prior_records = build_user_profiles_with_rr_ldp(
+            train_records, bio_features, vocab, LDP_EPSILON, seed=SEED,
+        )
+    else:
+        user_profiles, user_to_idx = build_user_profiles(
+            train_records, bio_features, vocab
+        )
+        private_prior_records = train_records
     print(f"  Users         : {len(user_to_idx)}")
     print(f"  Profile dim   : {user_profiles.shape[1]}")
 
@@ -754,14 +882,18 @@ def main():
         server_shared, user_gates, test_arrays, user_profiles, device
     )
 
-    print("\nApplying local-history prior calibration...")
-    np.random.seed(SEED)
-    prior_model = build_local_prior_model(train_records)
-    probs, used_local_prior = apply_local_prior_calibration(
-        probs,
-        test_records,
-        prior_model,
-    )
+    if LOCAL_PRIOR_ENABLED:
+        print("\nApplying local-history prior calibration...")
+        np.random.seed(SEED)
+        prior_model = build_local_prior_model(private_prior_records)
+        probs, used_local_prior = apply_local_prior_calibration(
+            probs,
+            test_records,
+            prior_model,
+        )
+    else:
+        print("\nSkipping local-history prior calibration...")
+        used_local_prior = np.zeros(len(test_records), dtype=bool)
     predictions = build_prediction_records(
         test_arrays,
         probs,
@@ -797,12 +929,18 @@ def main():
     metrics["ldp"] = {
         "mode": LDP_MODE,
         "epsilon": float(LDP_EPSILON),
+        "mechanism": {
+            "permission_history": "binary_randomized_response",
+            "bio_features": "categorical_randomized_response",
+            "eps_history_ratio": float(LDP_EPS_HISTORY_RATIO),
+        } if LDP_MODE == "user_stats" else {},
         "noise_positions": {
             "user_statistics": bool(LDP_MODE == "user_stats"),
             "gating_input": bool(LDP_MODE == "gating_input"),
         },
     }
     metrics["local_prior_calibration"] = {
+        "enabled": bool(LOCAL_PRIOR_ENABLED),
         "alpha": LOCAL_PRIOR_ALPHA,
         "confidence_threshold": LOCAL_PRIOR_CONF_THRESHOLD,
         "used_for_predictions": int(used_local_prior.sum()),
